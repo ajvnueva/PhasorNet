@@ -64,9 +64,7 @@ class InteractionPotential(nn.Module):
         psi_i = wavefunctions.unsqueeze(2)
         psi_j = wavefunctions.unsqueeze(1)
 
-        interaction = (
-            torch.conj(psi_j) * psi_i
-        )
+        interaction = torch.conj(psi_j) * psi_i
         # [B, N, N, D]
 
         x = torch.cat(
@@ -105,26 +103,7 @@ class KineticOperator(nn.Module):
 
 
 class Hamiltonian(nn.Module):
-    """
-    Compute normalized complex expectation energies.
-
-         psi_i† H_i psi_i
-    E_i = -----------------
-          psi_i† psi_i
-
-    where
-
-        H_i =
-            T
-            + diag(sum_j V(|psi_j|²))
-
-    and the exchange contribution is
-
-        sum_j V(psi_j* ⊙ psi_i) ⊙ psi_j.
-
-    Returns:
-        energy: [B, N]
-    """
+    """Compute normalized complex expectation energies."""
 
     def __init__(self, state_dim, hidden_dim):
         super().__init__()
@@ -157,15 +136,13 @@ class Hamiltonian(nn.Module):
         # [B, N, D]
 
         kinetic_energy = torch.sum(
-            torch.conj(wavefunctions)
-            * kinetic_action,
+            torch.conj(wavefunctions) * kinetic_action,
             dim=-1,
         )
         # [B, N]
 
         local_energy = torch.sum(
-            torch.abs(wavefunctions) ** 2
-            * local.unsqueeze(1),
+            torch.abs(wavefunctions) ** 2 * local.unsqueeze(1),
             dim=-1,
         )
         # [B, N]
@@ -174,17 +151,12 @@ class Hamiltonian(nn.Module):
         # [B, N, D]
 
         exchange_energy = torch.sum(
-            torch.conj(wavefunctions)
-            * exchange,
+            torch.conj(wavefunctions) * exchange,
             dim=-1,
         )
         # [B, N]
 
-        numerator = (
-            kinetic_energy
-            + local_energy
-            + exchange_energy
-        )
+        numerator = kinetic_energy + local_energy + exchange_energy
         # [B, N]
 
         norm = torch.sum(
@@ -193,9 +165,7 @@ class Hamiltonian(nn.Module):
         )
         # [B, N]
 
-        eps = torch.finfo(
-            wavefunctions.real.dtype
-        ).eps
+        eps = torch.finfo(wavefunctions.real.dtype).eps
 
         energy = numerator / norm.clamp_min(eps)
         # [B, N]
@@ -245,8 +215,8 @@ class ModeExcitations(nn.Module):
 
 
 class StateSuperposition(nn.Module):
-    """
-    Observation excites learned modes.
+    """Observation excites learned modes.
+
     The observed state is superposed with the latent state.
     """
 
@@ -270,18 +240,14 @@ class StateSuperposition(nn.Module):
     def forward(self, observation, psi_latent):
         modes = self.normal_modes()
 
-        excitations = self.mode_excitations(
-            observation
-        )
+        excitations = self.mode_excitations(observation)
 
         psi_observed = (
-            excitations.unsqueeze(-1)
-            * modes.T.unsqueeze(0)
+            excitations.unsqueeze(-1) * modes.T.unsqueeze(0)
         )
 
         psi_latent = (
-            self.alpha * psi_latent
-            + self.beta * psi_observed
+            self.alpha * psi_latent + self.beta * psi_observed
         )
 
         return psi_latent
@@ -304,24 +270,17 @@ class Propagator(nn.Module):
         energy = self.hamiltonian(psi_latent)
         # [B, N]
 
-        evolution = torch.exp(
-            1j * energy * dt
-        )
+        evolution = torch.exp(1j * energy * dt)
         # [B, N]
 
-        psi_next = (
-            evolution.unsqueeze(-1)
-            * psi_latent
-        )
+        psi_next = evolution.unsqueeze(-1) * psi_latent
         # [B, N, D]
 
         return psi_next
 
 
 class PhasorNetBase(nn.Module):
-    """
-    One independent PhasorNet dynamical layer.
-    """
+    """One independent PhasorNet dynamical layer."""
 
     def __init__(
         self,
@@ -367,15 +326,13 @@ class PhasorNetBase(nn.Module):
 
 
 class PhasorNet(nn.Module):
-    """
-    Stack of independent PhasorNet dynamical layers.
+    """Stack of independent PhasorNet dynamical layers.
 
-    Layer 0 receives the external observation.
+    Layer 0 receives the external observation. Each subsequent layer receives
+    the collapsed state_dim representation from the previous layer: Phi_l =
+    |sum_i psi_l,i|^2.
 
-    Each subsequent layer receives the collapsed
-    state_dim representation from the previous layer.
-
-        Phi_l = |sum_i psi_l,i|^2
+    The final hidden state is projected back to observation_dim.
     """
 
     def __init__(self, config):
@@ -402,6 +359,11 @@ class PhasorNet(nn.Module):
                 )
             )
 
+        # Output projection back to observation space
+        self.readout = nn.Linear(
+            config.state_dim, config.observation_dim
+        )
+
     def forward(self, observation, psi_latents):
         next_observation = observation
         next_psi_latents = []
@@ -416,13 +378,12 @@ class PhasorNet(nn.Module):
             )
 
             next_observation = (
-                torch.abs(
-                    psi_latent.sum(dim=1)
-                ) ** 2
+                torch.abs(psi_latent.sum(dim=1)) ** 2
             )
 
-            next_psi_latents.append(
-                psi_latent
-            )
+            next_psi_latents.append(psi_latent)
 
-        return next_observation, next_psi_latents
+        # Map state_dim [B, D] -> observation_dim [B, O]
+        output_observation = self.readout(next_observation)
+
+        return output_observation, next_psi_latents
