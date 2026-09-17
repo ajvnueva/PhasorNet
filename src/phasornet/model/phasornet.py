@@ -14,6 +14,33 @@ class PhasorNetConfig:
     dt: float = 0.05
 
 
+def normalize_state(psi, target_norm):
+    """
+    Globally normalize the complete latent state.
+
+    psi = sum_i c_i * mode_i
+
+    Enforces:
+        psi* psi = target_norm
+
+    One scalar is used for the entire state, so relative
+    mode amplitudes are preserved.
+    """
+    norm = torch.sum(
+        torch.abs(psi) ** 2,
+        dim=(-2, -1),
+        keepdim=True,
+    )
+
+    eps = torch.finfo(psi.real.dtype).eps
+
+    scale = torch.sqrt(
+        target_norm / norm.clamp_min(eps)
+    )
+
+    return psi * scale
+
+
 class LocalPotential(nn.Module):
     """V(|psi_j|^2)."""
 
@@ -142,12 +169,15 @@ class Hamiltonian(nn.Module):
         # [B, N]
 
         local_energy = torch.sum(
-            torch.abs(wavefunctions) ** 2 * local.unsqueeze(1),
+            torch.abs(wavefunctions) ** 2
+            * local.unsqueeze(1),
             dim=-1,
         )
         # [B, N]
 
-        exchange = self.interaction(wavefunctions).sum(dim=2)
+        exchange = self.interaction(
+            wavefunctions
+        ).sum(dim=2)
         # [B, N, D]
 
         exchange_energy = torch.sum(
@@ -156,7 +186,11 @@ class Hamiltonian(nn.Module):
         )
         # [B, N]
 
-        numerator = kinetic_energy + local_energy + exchange_energy
+        numerator = (
+            kinetic_energy
+            + local_energy
+            + exchange_energy
+        )
         # [B, N]
 
         norm = torch.sum(
@@ -165,7 +199,9 @@ class Hamiltonian(nn.Module):
         )
         # [B, N]
 
-        eps = torch.finfo(wavefunctions.real.dtype).eps
+        eps = torch.finfo(
+            wavefunctions.real.dtype
+        ).eps
 
         energy = numerator / norm.clamp_min(eps)
         # [B, N]
@@ -215,13 +251,29 @@ class ModeExcitations(nn.Module):
 
 
 class StateSuperposition(nn.Module):
-    """Observation excites learned modes.
+    """
+    Observation excites learned modes.
 
-    The observed state is superposed with the latent state.
+    psi = sum_i c_i * mode_i
+
+    The complete state is globally normalized so that:
+
+        psi* psi = num_modes
+
+    The same normalization factor is applied to every
+    mode contribution.
     """
 
-    def __init__(self, state_dim, observation_dim, hidden_dim, num_modes):
+    def __init__(
+        self,
+        state_dim,
+        observation_dim,
+        hidden_dim,
+        num_modes,
+    ):
         super().__init__()
+
+        self.num_modes = num_modes
 
         self.normal_modes = NormalModes(
             state_dim,
@@ -234,30 +286,53 @@ class StateSuperposition(nn.Module):
             num_modes,
         )
 
-        self.alpha = nn.Parameter(torch.tensor(1.0))
-        self.beta = nn.Parameter(torch.tensor(1.0))
+        self.alpha = nn.Parameter(
+            torch.tensor(1.0)
+        )
+
+        self.beta = nn.Parameter(
+            torch.tensor(1.0)
+        )
 
     def forward(self, observation, psi_latent):
         modes = self.normal_modes()
 
-        excitations = self.mode_excitations(observation)
-
-        psi_observed = (
-            excitations.unsqueeze(-1) * modes.T.unsqueeze(0)
+        excitations = self.mode_excitations(
+            observation
         )
 
+        psi_observed = (
+            excitations.unsqueeze(-1)
+            * modes.T.unsqueeze(0)
+        )
+        # [B, N, D]
+
         psi_latent = (
-            self.alpha * psi_latent + self.beta * psi_observed
+            self.alpha * psi_latent
+            + self.beta * psi_observed
+        )
+
+        psi_latent = normalize_state(
+            psi_latent,
+            self.num_modes,
         )
 
         return psi_latent
 
 
 class Propagator(nn.Module):
-    """Propagate all latent modes through their expectation energies."""
+    """
+    Propagate all latent modes through their
+    expectation energies.
+
+    The propagated complete state is normalized
+    to the fixed total norm afterward.
+    """
 
     def __init__(self, config):
         super().__init__()
+
+        self.num_modes = config.num_modes
 
         self.hamiltonian = Hamiltonian(
             config.state_dim,
@@ -265,16 +340,28 @@ class Propagator(nn.Module):
         )
 
     def forward(self, psi_latent, dt):
-        # psi_latent: [B, N, D]
-
-        energy = self.hamiltonian(psi_latent)
-        # [B, N]
-
-        evolution = torch.exp(1j * energy * dt)
-        # [B, N]
-
-        psi_next = evolution.unsqueeze(-1) * psi_latent
         # [B, N, D]
+
+        energy = self.hamiltonian(
+            psi_latent
+        )
+        # [B, N]
+
+        evolution = torch.exp(
+            1j * energy * dt
+        )
+        # [B, N]
+
+        psi_next = (
+            evolution.unsqueeze(-1)
+            * psi_latent
+        )
+        # [B, N, D]
+
+        psi_next = normalize_state(
+            psi_next,
+            self.num_modes,
+        )
 
         return psi_next
 
@@ -326,13 +413,18 @@ class PhasorNetBase(nn.Module):
 
 
 class PhasorNet(nn.Module):
-    """Stack of independent PhasorNet dynamical layers.
+    """
+    Stack of independent PhasorNet dynamical layers.
 
-    Layer 0 receives the external observation. Each subsequent layer receives
-    the collapsed state_dim representation from the previous layer: Phi_l =
-    |sum_i psi_l,i|^2.
+    Layer 0 receives the external observation.
+    Each subsequent layer receives the collapsed
+    state_dim representation from the previous layer:
 
-    The final hidden state is projected back to observation_dim.
+        Phi_l = |sum_i psi_l,i|^2
+
+    Every layer maintains:
+
+        psi* psi = num_modes
     """
 
     def __init__(self, config):
@@ -359,9 +451,9 @@ class PhasorNet(nn.Module):
                 )
             )
 
-        # Output projection back to observation space
         self.readout = nn.Linear(
-            config.state_dim, config.observation_dim
+            config.state_dim,
+            config.observation_dim,
         )
 
     def forward(self, observation, psi_latents):
@@ -378,12 +470,20 @@ class PhasorNet(nn.Module):
             )
 
             next_observation = (
-                torch.abs(psi_latent.sum(dim=1)) ** 2
+                torch.abs(
+                    psi_latent.sum(dim=1)
+                ) ** 2
             )
 
-            next_psi_latents.append(psi_latent)
+            next_psi_latents.append(
+                psi_latent
+            )
 
-        # Map state_dim [B, D] -> observation_dim [B, O]
-        output_observation = self.readout(next_observation)
+        output_observation = self.readout(
+            next_observation
+        )
 
-        return output_observation, next_psi_latents
+        return (
+            output_observation,
+            next_psi_latents,
+        )
