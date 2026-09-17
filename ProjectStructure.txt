@@ -1,0 +1,22 @@
+PhasorNet/
+├── .git/
+├── .gitignore
+│
+├── src/                              # Main research library (pip-installable module)
+│   └── phasornet/
+│       ├── __init__.py
+│       │
+│       ├──  model/
+│       │
+│       └──  experimental/            # Sandbox for unverified/active research variants
+│
+├── experiments/                      # Experiment suites and benchmarks
+│       ├── E0/                       # Sine Evolutions  
+│           ├── data/
+│           │
+│           └── model/
+│
+│
+└── outputs/                          # Local artifacts (Git-ignored)
+    ├── checkpoints/                  # Model weights saved per experiment run
+    └── logs/                         # TensorBoard / WandB local log caches:
