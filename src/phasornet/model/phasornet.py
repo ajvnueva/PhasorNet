@@ -104,6 +104,9 @@ class ModeExcitations(nn.Module):
     def forward(self, observation: torch.Tensor) -> torch.Tensor:
         weights = self.mode_weights(observation)
         real, imag = weights.chunk(2, dim=-1)
+
+        real = real.float()
+        imag = imag.float()
         return torch.complex(real, imag)
 
 
