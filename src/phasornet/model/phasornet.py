@@ -23,7 +23,7 @@ def normalize_state(psi: torch.Tensor, target_norm: float) -> torch.Tensor:
 
 
 class InteractionPotential(nn.Module):
-    """V_interaction = sum_j 0.5 * (overlap_ij + overlap_ji)."""
+    """V_i = sum_j 0.5 * (psi_j* psi_i + psi_i* psi_j)."""
 
     def forward(self, wavefunctions: torch.Tensor) -> torch.Tensor:
         total_conj = torch.conj(wavefunctions).sum(dim=1)
@@ -33,9 +33,8 @@ class InteractionPotential(nn.Module):
 
 class LocalPotential(nn.Module):
     """V_local = sum_j |psi_j|^2."""
-
     def forward(self, wavefunctions: torch.Tensor) -> torch.Tensor:
-        return torch.abs(wavefunctions) ** 2
+        return torch.abs(wavefunctions).pow(2).sum(dim=1)
 
 
 class KineticOperator(nn.Module):
@@ -62,8 +61,11 @@ class Hamiltonian(nn.Module):
 
     def forward(self, wavefunctions: torch.Tensor) -> torch.Tensor:
         # wavefunctions: [B, N, D]
-        T = self.kinetic()
-        V = self.local(wavefunctions) + self.interaction(wavefunctions)
+        T = self.kinetic()                               # [D,D]
+        V_local = self.local(wavefunctions)              # [B,D]
+        V_interaction = self.interaction(wavefunctions)  # [B,N,D]
+
+        V = V_local.unsqueeze(1) + V_interaction         # [B,N,D]
 
         T_psi = torch.matmul(wavefunctions, T.T)
         H_psi = T_psi + V * wavefunctions
