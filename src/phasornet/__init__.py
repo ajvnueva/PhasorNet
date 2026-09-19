@@ -1,3 +1,3 @@
-from .model import PhasorNet, PhasorNetConfig
+from .model import PhasorNet, PhasorNetConfig, PhasorState
 
-__all__ = ["PhasorNet", "PhasorNetConfig"]
+__all__ = ["PhasorNet", "PhasorNetConfig", "PhasorState" ]
