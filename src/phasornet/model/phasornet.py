@@ -1,5 +1,6 @@
-from dataclasses import dataclass
 
+
+from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
@@ -7,15 +8,39 @@ import torch.nn as nn
 @dataclass
 class PhasorNetConfig:
     num_phasors: int = 3
-    observation_intervals: tuple[int, ...] = (32, 16, 1)
-
-    observation_dims: tuple[int, ...] = (64, 64, 64)
-    state_dims: tuple[int, ...] = (128, 128, 128)
-    num_modes: tuple[int, ...] = (16, 16, 16)
-    hidden_dims: tuple[int, ...] = (256, 256, 256)
-
     num_layers: int = 2
+    observation_freqs: tuple[float, ...] = (1 / 32.0, 1 / 16.0, 0.0)
+    observable_dims: tuple[int, ...] = (64, 128)
+    state_dims: tuple[int, ...] = (128, 128)
+    num_modes: tuple[int, ...] = (8, 8)
+    hidden_dims: tuple[int, ...] = (256, 256)
     dt: float = 0.05
+
+    def __post_init__(self):
+        if len(self.observation_freqs) < self.num_phasors:
+            raise ValueError(
+                f"Length of observation_freqs ({len(self.observation_freqs)}) "
+                f"must be >= num_phasors ({self.num_phasors})."
+            )
+
+        layer_configs = [
+            ("observable_dims", self.observable_dims),
+            ("state_dims", self.state_dims),
+            ("num_modes", self.num_modes),
+            ("hidden_dims", self.hidden_dims),
+        ]
+        for name, cfg_tuple in layer_configs:
+            if len(cfg_tuple) < self.num_layers:
+                raise ValueError(
+                    f"Length of {name} ({len(cfg_tuple)}) must be >= num_layers ({self.num_layers})."
+                )
+
+        for l in range(1, self.num_layers):
+            if self.observable_dims[l] != self.state_dims[l - 1]:
+                raise ValueError(
+                    f"Layer {l} observable_dim ({self.observable_dims[l]}) must match "
+                    f"layer {l-1} state_dim ({self.state_dims[l - 1]})."
+                )
 
 
 def normalize_state(
@@ -27,13 +52,13 @@ def normalize_state(
         dim=(-2, -1),
         keepdim=True,
     )
+
     eps = torch.finfo(psi.real.dtype).eps
-    scale = torch.sqrt(target_norm / norm.clamp_min(eps))
-    return psi * scale
+    return psi * torch.sqrt(target_norm / norm.clamp_min(eps))
 
 
 class InteractionPotential(nn.Module):
-    """V_i = sum_j 0.5 * (psi_j* psi_i + psi_i* psi_j)."""
+    """Inter-mode potential within a single Phasor."""
 
     def forward(self, wavefunctions: torch.Tensor) -> torch.Tensor:
         total_conj = torch.conj(wavefunctions).sum(dim=1)
@@ -41,7 +66,7 @@ class InteractionPotential(nn.Module):
 
 
 class LocalPotential(nn.Module):
-    """V_local = sum_j |psi_j|^2."""
+    """Local probability-density potential."""
 
     def forward(self, wavefunctions: torch.Tensor) -> torch.Tensor:
         return torch.abs(wavefunctions).pow(2).sum(dim=1)
@@ -52,16 +77,13 @@ class KineticOperator(nn.Module):
 
     def __init__(self, state_dim: int):
         super().__init__()
-        self.real = nn.Parameter(
-            torch.randn(state_dim, state_dim) * 0.02
-        )
-        self.imag = nn.Parameter(
-            torch.randn(state_dim, state_dim) * 0.02
-        )
+
+        self.real = nn.Parameter(torch.randn(state_dim, state_dim) * 0.02)
+        self.imag = nn.Parameter(torch.randn(state_dim, state_dim) * 0.02)
 
     def forward(self) -> torch.Tensor:
         T = torch.complex(self.real, self.imag)
-        return 0.5 * (T + torch.conj(T.T))
+        return 0.5 * (T + T.mH)
 
 
 class Hamiltonian(nn.Module):
@@ -69,6 +91,7 @@ class Hamiltonian(nn.Module):
 
     def __init__(self, state_dim: int):
         super().__init__()
+
         self.kinetic = KineticOperator(state_dim)
         self.local = LocalPotential()
         self.interaction = InteractionPotential()
@@ -80,21 +103,21 @@ class Hamiltonian(nn.Module):
     ) -> torch.Tensor:
         T = self.kinetic()
 
-        V_local = self.local(wavefunctions)
-        V_interaction = self.interaction(wavefunctions)
-
-        V = V_local.unsqueeze(1) + V_interaction
+        V = (
+            self.local(wavefunctions).unsqueeze(1)
+            + self.interaction(wavefunctions)
+        )
 
         if external_potential is not None:
             V = V + external_potential.unsqueeze(1)
 
-        T_psi = torch.matmul(wavefunctions, T.T)
-        H_psi = T_psi + V * wavefunctions
+        H_psi = torch.matmul(wavefunctions, T.T) + V * wavefunctions
 
         numerator = torch.sum(
             torch.conj(wavefunctions) * H_psi,
             dim=-1,
         )
+
         norm = torch.sum(
             torch.abs(wavefunctions) ** 2,
             dim=-1,
@@ -105,16 +128,13 @@ class Hamiltonian(nn.Module):
 
 
 class NormalModes(nn.Module):
-    """Learned persistent complex normal modes."""
+    """Learned complex normal modes."""
 
     def __init__(self, state_dim: int, num_modes: int):
         super().__init__()
-        self.real = nn.Parameter(
-            torch.randn(state_dim, num_modes) * 0.02
-        )
-        self.imag = nn.Parameter(
-            torch.randn(state_dim, num_modes) * 0.02
-        )
+
+        self.real = nn.Parameter(torch.randn(state_dim, num_modes) * 0.02)
+        self.imag = nn.Parameter(torch.randn(state_dim, num_modes) * 0.02)
 
     def forward(self) -> torch.Tensor:
         return torch.complex(self.real, self.imag)
@@ -123,31 +143,27 @@ class NormalModes(nn.Module):
 class ModeExcitations(nn.Module):
     """Maps observations to complex mode weights."""
 
-    def __init__(
-        self,
-        observation_dim: int,
-        hidden_dim: int,
-        num_modes: int,
-    ):
+    def __init__(self, observable_dim: int, hidden_dim: int, num_modes: int):
         super().__init__()
+
         self.mode_weights = nn.Sequential(
-            nn.Linear(observation_dim, hidden_dim),
+            nn.Linear(observable_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, num_modes * 2),
         )
 
     def forward(self, observation: torch.Tensor) -> torch.Tensor:
         real, imag = self.mode_weights(observation).chunk(2, dim=-1)
-        return torch.complex(real.float(), imag.float())
+        return torch.complex(real, imag)
 
 
 class StateSuperposition(nn.Module):
-    """Excites and normalizes the latent modes."""
+    """Combines latent state with observation."""
 
     def __init__(
         self,
         state_dim: int,
-        observation_dim: int,
+        observable_dim: int,
         hidden_dim: int,
         num_modes: int,
     ):
@@ -156,9 +172,7 @@ class StateSuperposition(nn.Module):
         self.num_modes = num_modes
         self.normal_modes = NormalModes(state_dim, num_modes)
         self.mode_excitations = ModeExcitations(
-            observation_dim,
-            hidden_dim,
-            num_modes,
+            observable_dim, hidden_dim, num_modes
         )
 
         self.alpha = nn.Parameter(torch.tensor(1.0))
@@ -172,24 +186,16 @@ class StateSuperposition(nn.Module):
         modes = self.normal_modes()
         excitations = self.mode_excitations(observation)
 
-        psi_observed = (
-            excitations.unsqueeze(-1)
-            * modes.T.unsqueeze(0)
-        )
-
+        psi_observed = excitations.unsqueeze(-1) * modes.T.unsqueeze(0)
         psi = self.alpha * psi_latent + self.beta * psi_observed
 
-        return normalize_state(psi, self.num_modes)
+        return normalize_state(psi, float(self.num_modes))
 
 
 class Propagator(nn.Module):
     """Evolves latent modes through the Hamiltonian."""
 
-    def __init__(
-        self,
-        state_dim: int,
-        num_modes: int,
-    ):
+    def __init__(self, state_dim: int, num_modes: int):
         super().__init__()
 
         self.num_modes = num_modes
@@ -202,36 +208,42 @@ class Propagator(nn.Module):
         dt: float,
     ) -> torch.Tensor:
         energy = self.hamiltonian(psi, external_potential)
-        evolution = torch.exp(1j * energy * dt)
-        psi_next = evolution.unsqueeze(-1) * psi
 
-        return normalize_state(psi_next, self.num_modes)
+        psi_next = torch.exp(-1j * energy * dt).unsqueeze(-1) * psi
 
+        return normalize_state(psi_next, float(self.num_modes))
 
 class Phasor(nn.Module):
-    """
-    One complete dynamical unit.
-
-    Returns:
-        modes: [B, N, D]
-        collapse: [B, D]
-    """
 
     def __init__(
         self,
         state_dim: int,
-        observation_dim: int,
+        observable_dim: int,
         hidden_dim: int,
         num_modes: int,
         dt: float,
+        observation_freq: float,
     ):
         super().__init__()
 
+        self.state_dim = state_dim
+        self.num_modes = num_modes
         self.dt = dt
+        self.observation_freq = observation_freq
+        self.is_periodic = observation_freq > 0.0
+
+        if self.is_periodic:
+            self.observation_interval = 1.0 / observation_freq
+        else:
+            self.observation_interval = None
+
+        # Buffer retained for state_dict consistency across all Phasor instances
+        self.register_buffer("time", torch.tensor(0.0), persistent=True)
+        self.register_buffer("psi_latent", None, persistent=False)
 
         self.superposition = StateSuperposition(
             state_dim=state_dim,
-            observation_dim=observation_dim,
+            observable_dim=observable_dim,
             hidden_dim=hidden_dim,
             num_modes=num_modes,
         )
@@ -241,18 +253,61 @@ class Phasor(nn.Module):
             num_modes=num_modes,
         )
 
+    def init_state(
+        self,
+        batch_size: int,
+        device: torch.device | str = "cpu",
+        dtype: torch.dtype = torch.complex64,
+    ):
+        self.psi_latent = torch.zeros(
+            (batch_size, self.num_modes, self.state_dim),
+            dtype=dtype,
+            device=device,
+        )
+
+    def reset_state(
+        self,
+        batch_size: int | None = None,
+        device: torch.device | str | None = None,
+    ):
+        self.time.zero_()
+        if batch_size is not None:
+            dev = device if device is not None else self.time.device
+            self.init_state(batch_size, device=dev)
+        else:
+            self.psi_latent = None
+
+    def detach_state(self):
+        if self.psi_latent is not None:
+            self.psi_latent = self.psi_latent.detach()
+
     def collapse(self, modes: torch.Tensor) -> torch.Tensor:
         return torch.abs(modes.sum(dim=1)).pow(2)
 
     def forward(
         self,
         observation: torch.Tensor,
-        psi_latent: torch.Tensor,
         external_potential: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+
+        batch_size = observation.shape[0]
+        if self.psi_latent is None or self.psi_latent.shape[0] != batch_size:
+            self.init_state(
+                batch_size=batch_size,
+                device=observation.device,
+            )
+
+        # Apply periodic modulation only if frequency > 0
+        if self.is_periodic:
+            obs_scaled = observation * torch.cos(
+                2.0 * torch.pi * self.observation_freq * self.time
+            ).pow(2)
+        else:
+            obs_scaled = observation
+
         psi = self.superposition(
-            observation,
-            psi_latent,
+            obs_scaled,
+            self.psi_latent,
         )
 
         modes = self.propagator(
@@ -261,58 +316,46 @@ class Phasor(nn.Module):
             self.dt,
         )
 
+        # Update persistent latent state
+        self.psi_latent = modes
+
+        # Advance and wrap time buffer only if periodic
+        if self.is_periodic:
+            with torch.no_grad():
+                self.time.add_(self.dt).remainder_(self.observation_interval)
+
         return modes, self.collapse(modes)
 
 
 class PhasorStack(nn.Module):
-    """
-    One hierarchical layer of Phasors.
+    """P0 -> C0 -> P1 -> C1 -> ... -> Pn -> Cn."""
 
-    P0 -> C0 -> P1 -> C1 -> ... -> Pn -> Cn
-    """
-
-    def __init__(
-        self,
-        config: PhasorNetConfig,
-        input_dim: int,
-    ):
+    def __init__(self, config: PhasorNetConfig, layer: int):
         super().__init__()
-
-        self.observation_intervals = config.observation_intervals
-
-        self.input_projections = nn.ModuleList([
-            nn.Linear(
-                input_dim,
-                config.observation_dims[i],
-            )
-            for i in range(config.num_phasors)
-        ])
 
         self.phasors = nn.ModuleList([
             Phasor(
-                state_dim=config.state_dims[i],
-                observation_dim=config.observation_dims[i],
-                hidden_dim=config.hidden_dims[i],
-                num_modes=config.num_modes[i],
+                state_dim=config.state_dims[layer],
+                observable_dim=config.observable_dims[layer],
+                hidden_dim=config.hidden_dims[layer],
+                num_modes=config.num_modes[layer],
                 dt=config.dt,
+                observation_freq=config.observation_freqs[phasor_idx],
             )
-            for i in range(config.num_phasors)
+            for phasor_idx in range(config.num_phasors)
         ])
 
     def forward(
         self,
         observation: torch.Tensor,
-        psi_latents: list[torch.Tensor],
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+
         results = []
         external_potential = None
 
-        for i, phasor in enumerate(self.phasors):
-            phasor_observation = self.input_projections[i](observation)
-
+        for phasor in self.phasors:
             modes, collapsed = phasor(
-                observation=phasor_observation,
-                psi_latent=psi_latents[i],
+                observation=observation,
                 external_potential=external_potential,
             )
 
@@ -323,57 +366,53 @@ class PhasorStack(nn.Module):
 
 
 class PhasorNet(nn.Module):
-    """
-    Sequential hierarchy of PhasorStacks.
-
-    Observation
-        -> Stack 0
-        -> Stack 1
-        -> ...
-        -> final fast collapse
-    """
+    """Sequential hierarchy of PhasorStacks with persistent internal states."""
 
     def __init__(self, config: PhasorNetConfig):
         super().__init__()
 
         self.config = config
+        self.stacks = nn.ModuleList([
+            PhasorStack(config=config, layer=layer)
+            for layer in range(config.num_layers)
+        ])
+        self.observable_projection = nn.Linear(
+            config.state_dims[-1],
+            config.observable_dims[0],
+        )
 
-        self.stacks = nn.ModuleList()
+    def reset_states(
+        self,
+        batch_size: int | None = None,
+        device: torch.device | str | None = None,
+    ):
+        """Resets time and latent states across all Phasors in the model."""
+        for stack in self.stacks:
+            for phasor in stack.phasors:
+                phasor.reset_state(batch_size=batch_size, device=device)
 
-        input_dim = config.observation_dims[0]
-
-        for layer in range(config.num_layers):
-            stack = PhasorStack(
-                config=config,
-                input_dim=input_dim,
-            )
-            self.stacks.append(stack)
-
-            input_dim = config.state_dims[-1]
+    def detach_states(self):
+        """Detaches latent states from autograd computational graphs (TBPTT)."""
+        for stack in self.stacks:
+            for phasor in stack.phasors:
+                phasor.detach_state()
 
     def forward(
         self,
         observation: torch.Tensor,
-        psi_latents: list[list[torch.Tensor]],
     ) -> tuple[
         torch.Tensor,
         list[list[tuple[torch.Tensor, torch.Tensor]]],
     ]:
-        stack_input = observation
+        stack_observation = observation
         all_results = []
 
-        for layer, stack in enumerate(self.stacks):
-            results = stack(
-                observation=stack_input,
-                psi_latents=psi_latents[layer],
-            )
-
+        for stack in self.stacks:
+            results = stack(observation=stack_observation)
             all_results.append(results)
+            stack_observation = results[-1][1]
 
-            # Only the final Phasor collapse is forwarded
-            # to the next PhasorStack.
-            stack_input = results[-1][1]
+        final_collapse = all_results[-1][-1][1]
+        final_observable = self.observable_projection(final_collapse)
 
-        final_state = all_results[-1][-1][1]
-
-        return final_state, all_results
+        return final_observable, all_results

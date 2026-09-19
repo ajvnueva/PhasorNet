@@ -11,14 +11,19 @@ class E0Config:
 
     # --- PhasorNet Architecture ---
     num_phasors: int = 3
-    observation_intervals: tuple[int, ...] = (32, 16, 1)
-
-    observation_dims: tuple[int, ...] = (64, 64, 64)
-    state_dims: tuple[int, ...] = (128, 128, 128)
-    num_modes: tuple[int, ...] = (8, 8, 8)
-    hidden_dims: tuple[int, ...] = (256, 256, 256)
-
     num_layers: int = 2
+    
+    observation_freqs: tuple[float, ...] = (1/32, 1/16, 0.0)
+    # Observation dimension at each hierarchical layer.
+    observable_dims: tuple[int, ...] = (64, 128)
+    # State dimension of each layer.
+    state_dims: tuple[int, ...] = (128, 128)
+    # Number of modes in each Phasor.
+    num_modes: tuple[int, ...] = (8, 8)
+    # Hidden dimension for mode excitation.
+    hidden_dims: tuple[int, ...] = (256, 256)
+
+
 
     # --- Training Hyperparameters ---
     batch_size: int = 32
@@ -35,11 +40,11 @@ class E0Config:
     def to_phasornet_config(self) -> PhasorNetConfig:
         return PhasorNetConfig(
             num_phasors=self.num_phasors,
-            observation_intervals=self.observation_intervals,
-            observation_dims=self.observation_dims,
+            num_layers=self.num_layers,
+            observation_freqs=self.observation_freqs,
+            observable_dims=self.observable_dims,
             state_dims=self.state_dims,
             num_modes=self.num_modes,
             hidden_dims=self.hidden_dims,
-            num_layers=self.num_layers,
             dt=self.dt,
         )
