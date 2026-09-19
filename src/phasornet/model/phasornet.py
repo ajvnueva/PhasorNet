@@ -401,7 +401,7 @@ class PhasorNet(nn.Module):
             stack_observation = results[-1][1]
 
         final_collapse = all_results[-1][-1][1]
-        final_observable = self.observable_projection(final_state_val)
+        final_observable = self.observable_projection(final_collapse)
         next_state = PhasorState(latents=next_latents_all, times=next_times_all)
 
         return final_observable, all_results, next_state
