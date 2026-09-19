@@ -6,17 +6,27 @@ import torch.nn as nn
 
 @dataclass
 class PhasorNetConfig:
-    observation_dim: int
-    state_dim: int = 256
-    num_modes: int = 32
-    hidden_dim: int = 512
-    num_layers: int = 1
+    num_phasors: int = 3
+    observation_intervals: tuple[int, ...] = (32, 16, 1)
+
+    observation_dims: tuple[int, ...] = (64, 64, 64)
+    state_dims: tuple[int, ...] = (128, 128, 128)
+    num_modes: tuple[int, ...] = (16, 16, 16)
+    hidden_dims: tuple[int, ...] = (256, 256, 256)
+
+    num_layers: int = 2
     dt: float = 0.05
 
 
-def normalize_state(psi: torch.Tensor, target_norm: float) -> torch.Tensor:
-    """Globally normalizes latent state to target_norm preserving relative mode amplitudes."""
-    norm = torch.sum(torch.abs(psi) ** 2, dim=(-2, -1), keepdim=True)
+def normalize_state(
+    psi: torch.Tensor,
+    target_norm: float,
+) -> torch.Tensor:
+    norm = torch.sum(
+        torch.abs(psi) ** 2,
+        dim=(-2, -1),
+        keepdim=True,
+    )
     eps = torch.finfo(psi.real.dtype).eps
     scale = torch.sqrt(target_norm / norm.clamp_min(eps))
     return psi * scale
@@ -27,23 +37,27 @@ class InteractionPotential(nn.Module):
 
     def forward(self, wavefunctions: torch.Tensor) -> torch.Tensor:
         total_conj = torch.conj(wavefunctions).sum(dim=1)
-        overlap = wavefunctions * total_conj.unsqueeze(1)
-        return overlap.real
+        return (wavefunctions * total_conj.unsqueeze(1)).real
 
 
 class LocalPotential(nn.Module):
     """V_local = sum_j |psi_j|^2."""
+
     def forward(self, wavefunctions: torch.Tensor) -> torch.Tensor:
         return torch.abs(wavefunctions).pow(2).sum(dim=1)
 
 
 class KineticOperator(nn.Module):
-    """Learnable Hermitian operator T = 0.5 * (T + T^dagger)."""
+    """Learnable Hermitian kinetic operator."""
 
     def __init__(self, state_dim: int):
         super().__init__()
-        self.real = nn.Parameter(torch.randn(state_dim, state_dim) * 0.02)
-        self.imag = nn.Parameter(torch.randn(state_dim, state_dim) * 0.02)
+        self.real = nn.Parameter(
+            torch.randn(state_dim, state_dim) * 0.02
+        )
+        self.imag = nn.Parameter(
+            torch.randn(state_dim, state_dim) * 0.02
+        )
 
     def forward(self) -> torch.Tensor:
         T = torch.complex(self.real, self.imag)
@@ -51,7 +65,7 @@ class KineticOperator(nn.Module):
 
 
 class Hamiltonian(nn.Module):
-    """Computes real expectation energies H = T + V."""
+    """Computes real expectation energies."""
 
     def __init__(self, state_dim: int):
         super().__init__()
@@ -59,23 +73,35 @@ class Hamiltonian(nn.Module):
         self.local = LocalPotential()
         self.interaction = InteractionPotential()
 
-    def forward(self, wavefunctions: torch.Tensor) -> torch.Tensor:
-        # wavefunctions: [B, N, D]
-        T = self.kinetic()                               # [D,D]
-        V_local = self.local(wavefunctions)              # [B,D]
-        V_interaction = self.interaction(wavefunctions)  # [B,N,D]
+    def forward(
+        self,
+        wavefunctions: torch.Tensor,
+        external_potential: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        T = self.kinetic()
 
-        V = V_local.unsqueeze(1) + V_interaction         # [B,N,D]
+        V_local = self.local(wavefunctions)
+        V_interaction = self.interaction(wavefunctions)
+
+        V = V_local.unsqueeze(1) + V_interaction
+
+        if external_potential is not None:
+            V = V + external_potential.unsqueeze(1)
 
         T_psi = torch.matmul(wavefunctions, T.T)
         H_psi = T_psi + V * wavefunctions
 
-        numerator = torch.sum(torch.conj(wavefunctions) * H_psi, dim=-1)
-        norm = torch.sum(torch.abs(wavefunctions) ** 2, dim=-1)
+        numerator = torch.sum(
+            torch.conj(wavefunctions) * H_psi,
+            dim=-1,
+        )
+        norm = torch.sum(
+            torch.abs(wavefunctions) ** 2,
+            dim=-1,
+        )
 
         eps = torch.finfo(wavefunctions.real.dtype).eps
-        energy = numerator / norm.clamp_min(eps)
-        return energy.real
+        return (numerator / norm.clamp_min(eps)).real
 
 
 class NormalModes(nn.Module):
@@ -83,17 +109,26 @@ class NormalModes(nn.Module):
 
     def __init__(self, state_dim: int, num_modes: int):
         super().__init__()
-        self.real = nn.Parameter(torch.randn(state_dim, num_modes) * 0.02)
-        self.imag = nn.Parameter(torch.randn(state_dim, num_modes) * 0.02)
+        self.real = nn.Parameter(
+            torch.randn(state_dim, num_modes) * 0.02
+        )
+        self.imag = nn.Parameter(
+            torch.randn(state_dim, num_modes) * 0.02
+        )
 
     def forward(self) -> torch.Tensor:
         return torch.complex(self.real, self.imag)
 
 
 class ModeExcitations(nn.Module):
-    """Maps observation input to complex mode weights."""
+    """Maps observations to complex mode weights."""
 
-    def __init__(self, observation_dim: int, hidden_dim: int, num_modes: int):
+    def __init__(
+        self,
+        observation_dim: int,
+        hidden_dim: int,
+        num_modes: int,
+    ):
         super().__init__()
         self.mode_weights = nn.Sequential(
             nn.Linear(observation_dim, hidden_dim),
@@ -102,16 +137,12 @@ class ModeExcitations(nn.Module):
         )
 
     def forward(self, observation: torch.Tensor) -> torch.Tensor:
-        weights = self.mode_weights(observation)
-        real, imag = weights.chunk(2, dim=-1)
-
-        real = real.float()
-        imag = imag.float()
-        return torch.complex(real, imag)
+        real, imag = self.mode_weights(observation).chunk(2, dim=-1)
+        return torch.complex(real.float(), imag.float())
 
 
 class StateSuperposition(nn.Module):
-    """Excites modes via observation and enforces psi*psi = num_modes."""
+    """Excites and normalizes the latent modes."""
 
     def __init__(
         self,
@@ -121,44 +152,70 @@ class StateSuperposition(nn.Module):
         num_modes: int,
     ):
         super().__init__()
+
         self.num_modes = num_modes
         self.normal_modes = NormalModes(state_dim, num_modes)
         self.mode_excitations = ModeExcitations(
-            observation_dim, hidden_dim, num_modes
+            observation_dim,
+            hidden_dim,
+            num_modes,
         )
+
         self.alpha = nn.Parameter(torch.tensor(1.0))
         self.beta = nn.Parameter(torch.tensor(1.0))
 
     def forward(
-        self, observation: torch.Tensor, psi_latent: torch.Tensor
+        self,
+        observation: torch.Tensor,
+        psi_latent: torch.Tensor,
     ) -> torch.Tensor:
         modes = self.normal_modes()
         excitations = self.mode_excitations(observation)
 
-        psi_observed = excitations.unsqueeze(-1) * modes.T.unsqueeze(0)
-        psi_latent = self.alpha * psi_latent + self.beta * psi_observed
+        psi_observed = (
+            excitations.unsqueeze(-1)
+            * modes.T.unsqueeze(0)
+        )
 
-        return normalize_state(psi_latent, self.num_modes)
+        psi = self.alpha * psi_latent + self.beta * psi_observed
+
+        return normalize_state(psi, self.num_modes)
 
 
 class Propagator(nn.Module):
-    """Evolves latent state through expectation energies with norm constraint."""
+    """Evolves latent modes through the Hamiltonian."""
 
-    def __init__(self, config: PhasorNetConfig):
+    def __init__(
+        self,
+        state_dim: int,
+        num_modes: int,
+    ):
         super().__init__()
-        self.num_modes = config.num_modes
-        self.hamiltonian = Hamiltonian(config.state_dim)
 
-    def forward(self, psi_latent: torch.Tensor, dt: float) -> torch.Tensor:
-        energy = self.hamiltonian(psi_latent)
+        self.num_modes = num_modes
+        self.hamiltonian = Hamiltonian(state_dim)
+
+    def forward(
+        self,
+        psi: torch.Tensor,
+        external_potential: torch.Tensor | None,
+        dt: float,
+    ) -> torch.Tensor:
+        energy = self.hamiltonian(psi, external_potential)
         evolution = torch.exp(1j * energy * dt)
-        psi_next = evolution.unsqueeze(-1) * psi_latent
+        psi_next = evolution.unsqueeze(-1) * psi
 
         return normalize_state(psi_next, self.num_modes)
 
 
-class PhasorNetBase(nn.Module):
-    """Single PhasorNet dynamical layer."""
+class Phasor(nn.Module):
+    """
+    One complete dynamical unit.
+
+    Returns:
+        modes: [B, N, D]
+        collapse: [B, D]
+    """
 
     def __init__(
         self,
@@ -169,59 +226,154 @@ class PhasorNetBase(nn.Module):
         dt: float,
     ):
         super().__init__()
+
         self.dt = dt
+
         self.superposition = StateSuperposition(
-            state_dim, observation_dim, hidden_dim, num_modes
-        )
-        self.propagator = Propagator(
-            PhasorNetConfig(
-                observation_dim=observation_dim,
-                state_dim=state_dim,
-                num_modes=num_modes,
-                hidden_dim=hidden_dim,
-                dt=dt,
-            )
+            state_dim=state_dim,
+            observation_dim=observation_dim,
+            hidden_dim=hidden_dim,
+            num_modes=num_modes,
         )
 
-    def forward(self, observation: torch.Tensor, psi_latent: torch.Tensor) -> torch.Tensor:
-        psi_latent = self.superposition(observation, psi_latent)
-        return self.propagator(psi_latent, self.dt)
+        self.propagator = Propagator(
+            state_dim=state_dim,
+            num_modes=num_modes,
+        )
+
+    def collapse(self, modes: torch.Tensor) -> torch.Tensor:
+        return torch.abs(modes.sum(dim=1)).pow(2)
+
+    def forward(
+        self,
+        observation: torch.Tensor,
+        psi_latent: torch.Tensor,
+        external_potential: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        psi = self.superposition(
+            observation,
+            psi_latent,
+        )
+
+        modes = self.propagator(
+            psi,
+            external_potential,
+            self.dt,
+        )
+
+        return modes, self.collapse(modes)
+
+
+class PhasorStack(nn.Module):
+    """
+    One hierarchical layer of Phasors.
+
+    P0 -> C0 -> P1 -> C1 -> ... -> Pn -> Cn
+    """
+
+    def __init__(
+        self,
+        config: PhasorNetConfig,
+        input_dim: int,
+    ):
+        super().__init__()
+
+        self.observation_intervals = config.observation_intervals
+
+        self.input_projections = nn.ModuleList([
+            nn.Linear(
+                input_dim,
+                config.observation_dims[i],
+            )
+            for i in range(config.num_phasors)
+        ])
+
+        self.phasors = nn.ModuleList([
+            Phasor(
+                state_dim=config.state_dims[i],
+                observation_dim=config.observation_dims[i],
+                hidden_dim=config.hidden_dims[i],
+                num_modes=config.num_modes[i],
+                dt=config.dt,
+            )
+            for i in range(config.num_phasors)
+        ])
+
+    def forward(
+        self,
+        observation: torch.Tensor,
+        psi_latents: list[torch.Tensor],
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        results = []
+        external_potential = None
+
+        for i, phasor in enumerate(self.phasors):
+            phasor_observation = self.input_projections[i](observation)
+
+            modes, collapsed = phasor(
+                observation=phasor_observation,
+                psi_latent=psi_latents[i],
+                external_potential=external_potential,
+            )
+
+            results.append((modes, collapsed))
+            external_potential = collapsed
+
+        return results
 
 
 class PhasorNet(nn.Module):
-    """Stacked multi-layer PhasorNet architecture."""
+    """
+    Sequential hierarchy of PhasorStacks.
+
+    Observation
+        -> Stack 0
+        -> Stack 1
+        -> ...
+        -> final fast collapse
+    """
 
     def __init__(self, config: PhasorNetConfig):
         super().__init__()
+
         self.config = config
-        self.layers = nn.ModuleList()
 
-        for layer_idx in range(config.num_layers):
-            obs_dim = (
-                config.observation_dim
-                if layer_idx == 0
-                else config.state_dim
+        self.stacks = nn.ModuleList()
+
+        input_dim = config.observation_dims[0]
+
+        for layer in range(config.num_layers):
+            stack = PhasorStack(
+                config=config,
+                input_dim=input_dim,
             )
-            self.layers.append(
-                PhasorNetBase(
-                    state_dim=config.state_dim,
-                    observation_dim=obs_dim,
-                    hidden_dim=config.hidden_dim,
-                    num_modes=config.num_modes,
-                    dt=config.dt,
-                )
+            self.stacks.append(stack)
+
+            input_dim = config.state_dims[-1]
+
+    def forward(
+        self,
+        observation: torch.Tensor,
+        psi_latents: list[list[torch.Tensor]],
+    ) -> tuple[
+        torch.Tensor,
+        list[list[tuple[torch.Tensor, torch.Tensor]]],
+    ]:
+        stack_input = observation
+        all_results = []
+
+        for layer, stack in enumerate(self.stacks):
+            results = stack(
+                observation=stack_input,
+                psi_latents=psi_latents[layer],
             )
 
-        self.readout = nn.Linear(config.state_dim, config.observation_dim)
+            all_results.append(results)
 
-    def forward(self, observation: torch.Tensor, psi_latents: list):
-        next_observation = observation
-        next_psi_latents = []
+            # Only the final Phasor collapse is forwarded
+            # to the next PhasorStack.
+            stack_input = results[-1][1]
 
-        for layer, psi_latent in zip(self.layers, psi_latents):
-            psi_latent = layer(next_observation, psi_latent)
-            next_observation = torch.abs(psi_latent.sum(dim=1)) ** 2
-            next_psi_latents.append(psi_latent)
+        final_state = all_results[-1][-1][1]
 
-        output_observation = self.readout(next_observation)
-        return output_observation, next_psi_latents
+        return final_state, all_results

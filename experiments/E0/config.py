@@ -1,25 +1,29 @@
 from dataclasses import dataclass
 from phasornet import PhasorNetConfig
 
-
 @dataclass
 class E0Config:
     # --- Physical & Signal Parameters ---
-    feature_dim: int = 64  # Spatial resolution of sines (x-grid)
-    dt: float = 0.05  # Time step interval
-    seq_len_range: tuple = (200, 500)
-    num_components_range: tuple = (2, 4)
+    feature_dim: int = 64
+    dt: float = 0.05
+    seq_len_range: tuple = (64, 64)
+    num_components_range: tuple = (2, 6)
 
-    # --- Model Architecture ---
-    state_dim: int = 128
-    num_modes: int = 16
-    hidden_dim: int = 256
+    # --- PhasorNet Architecture ---
+    num_phasors: int = 3
+    observation_intervals: tuple[int, ...] = (32, 16, 1)
+
+    observation_dims: tuple[int, ...] = (64, 64, 64)
+    state_dims: tuple[int, ...] = (128, 128, 128)
+    num_modes: tuple[int, ...] = (8, 8, 8)
+    hidden_dims: tuple[int, ...] = (256, 256, 256)
+
     num_layers: int = 2
 
     # --- Training Hyperparameters ---
     batch_size: int = 32
     learning_rate: float = 1e-3
-    epochs: int = 20
+    epochs: int = 5
     train_samples: int = 10000
     val_samples: int = 1000
 
@@ -30,10 +34,12 @@ class E0Config:
 
     def to_phasornet_config(self) -> PhasorNetConfig:
         return PhasorNetConfig(
-            observation_dim=self.feature_dim,
-            state_dim=self.state_dim,
+            num_phasors=self.num_phasors,
+            observation_intervals=self.observation_intervals,
+            observation_dims=self.observation_dims,
+            state_dims=self.state_dims,
             num_modes=self.num_modes,
-            hidden_dim=self.hidden_dim,
+            hidden_dims=self.hidden_dims,
             num_layers=self.num_layers,
             dt=self.dt,
         )
