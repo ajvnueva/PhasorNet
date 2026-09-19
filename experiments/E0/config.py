@@ -29,8 +29,8 @@ class E0Config:
     batch_size: int = 32
     learning_rate: float = 1e-3
     epochs: int = 5
-    train_samples: int = 10000
-    val_samples: int = 1000
+    train_samples: int = 2000
+    val_samples: int = 200
 
     # --- Visualization & Evaluation ---
     animate_eval: bool = True

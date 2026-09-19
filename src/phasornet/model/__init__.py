@@ -1,3 +1,3 @@
-from .phasornet import PhasorNet, PhasorNetConfig, PhasorNetBase, Hamiltonian
+from .phasornet import PhasorNet, PhasorNetConfig, Phasor, Hamiltonian, PhasorState
 
-__all__ = ["PhasorNet", "PhasorNetConfig", "PhasorNetBase", "Hamiltonian"]
+__all__ = ["PhasorNet", "PhasorNetConfig", "Phasor", "Hamiltonian", "PhasorState"]
